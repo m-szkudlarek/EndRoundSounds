@@ -2,6 +2,7 @@
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes;
 using CounterStrikeSharp.API.Modules.Utils;
+using Microsoft.Extensions.Logging;
 
 namespace EndRoundSounds;
 
@@ -9,7 +10,7 @@ namespace EndRoundSounds;
 public class EndRoundSoundsPlugin : BasePlugin, IPluginConfig<EndRoundSoundsConfig>
 {
     public override string ModuleName => "End Round Sounds Plugin";
-    public override string ModuleVersion => "1.1.0";
+    public override string ModuleVersion => "1.1.1";
     public override string ModuleAuthor => "GianniKoch";
 
     public override string ModuleDescription =>
@@ -17,31 +18,53 @@ public class EndRoundSoundsPlugin : BasePlugin, IPluginConfig<EndRoundSoundsConf
 
     public required EndRoundSoundsConfig Config { get; set; }
 
+    private void LogInformation(string message) => Logger.LogInformation("[EndRoundSounds] {Message}", message);
+
+    private void LogWarning(string message) => Logger.LogWarning("[EndRoundSounds] {Message}", message);
+
     public override void Load(bool hotReload)
     {
+        LogInformation($"Load invoked. hotReload={hotReload}");
         RegisterEventHandler<EventRoundEnd>(OnRoundEnd);
-        Server.PrintToConsole("Loaded End Round Sounds Plugin!");
+        LogInformation("Registered EventRoundEnd handler.");
+        LogInformation("Loaded End Round Sounds Plugin!");
     }
 
     public void OnConfigParsed(EndRoundSoundsConfig config)
     {
         Config = config;
 
+        LogInformation("OnConfigParsed invoked.");
+        LogInformation(
+            $"Configuration mode: {nameof(Config.WinnerLoserDifferentiation)}={Config.WinnerLoserDifferentiation}, Sounds={Config.Sounds.Count}, SoundsWin={Config.SoundsWin.Count}, SoundsLose={Config.SoundsLose.Count}");
+
         if (Config.WinnerLoserDifferentiation)
         {
-            Server.PrintToConsole(
+            LogInformation(
                 $"Using {nameof(Config.WinnerLoserDifferentiation)}, found {Config.SoundsWin.Count} win sounds and {Config.SoundsLose.Count} lose sounds!");
         }
         else
         {
-            Server.PrintToConsole($"Found {Config.Sounds.Count} sounds!");
+            LogInformation($"Found {Config.Sounds.Count} sounds!");
+        }
+
+        if (Config.WinnerLoserDifferentiation && (Config.SoundsWin.Count == 0 || Config.SoundsLose.Count == 0))
+        {
+            LogWarning(
+                $"{nameof(Config.WinnerLoserDifferentiation)} is enabled but one side has no sounds configured. Sounds may fail for some players.");
+        }
+
+        if (!Config.WinnerLoserDifferentiation && Config.Sounds.Count == 0)
+        {
+            LogWarning("No sounds configured in shared mode.");
         }
     }
 
     public override void Unload(bool hotReload)
     {
         DeregisterEventHandler<EventRoundEnd>(OnRoundEnd);
-        Server.PrintToConsole("Unloaded End Round Sounds Plugin!");
+        LogInformation($"Unload invoked. hotReload={hotReload}");
+        LogInformation("Unloaded End Round Sounds Plugin!");
     }
 
     /// <summary>
@@ -52,17 +75,33 @@ public class EndRoundSoundsPlugin : BasePlugin, IPluginConfig<EndRoundSoundsConf
     /// <returns></returns>
     private HookResult OnRoundEnd(EventRoundEnd @event, GameEventInfo info)
     {
-        if (ShouldSkipEndRoundSounds())
+        LogInformation($"OnRoundEnd triggered. winner={(CsTeam)@event.Winner}");
+
+        if (ShouldSkipEndRoundSounds(out var skipReason))
         {
+            LogInformation($"Skipping end-round sound playback. Reason: {skipReason}");
             return HookResult.Continue;
         }
 
         var players = Utilities.GetPlayers();
+        LogInformation($"Found {players.Count} players to process.");
+
+        var winningTeam = (CsTeam)@event.Winner;
         foreach (var player in players)
         {
-            var sound = GetSoundPathForPlayer(player, (CsTeam)@event.Winner);
+            var sound = GetSoundPathForPlayer(player, winningTeam);
+
+            if (string.IsNullOrWhiteSpace(sound))
+            {
+                LogWarning($"Selected an empty sound path for playerTeam={player.Team}. Skipping playback for this player.");
+                continue;
+            }
+
+            LogInformation($"PlayerTeam={player.Team}, WinningTeam={winningTeam}, SelectedSound='{sound}'");
             PlaySoundForPlayer(player, sound);
         }
+
+        LogInformation("Finished processing OnRoundEnd playback.");
 
         return HookResult.Continue;
     }
@@ -71,9 +110,23 @@ public class EndRoundSoundsPlugin : BasePlugin, IPluginConfig<EndRoundSoundsConf
     /// Config is empty, or no sounds are set, skip playing the end sounds.
     /// </summary>
     /// <returns>Config is invalid</returns>
-    private bool ShouldSkipEndRoundSounds() =>
-        (Config.SoundsWin.Count == 0 && Config.SoundsLose.Count == 0 && Config.WinnerLoserDifferentiation) ||
-        (Config.Sounds.Count == 0 && !Config.WinnerLoserDifferentiation);
+    private bool ShouldSkipEndRoundSounds(out string reason)
+    {
+        if (Config.WinnerLoserDifferentiation && Config.SoundsWin.Count == 0 && Config.SoundsLose.Count == 0)
+        {
+            reason = "Winner/loser differentiation mode is enabled and both SoundsWin and SoundsLose are empty.";
+            return true;
+        }
+
+        if (!Config.WinnerLoserDifferentiation && Config.Sounds.Count == 0)
+        {
+            reason = "Shared sound mode is enabled and Sounds is empty.";
+            return true;
+        }
+
+        reason = string.Empty;
+        return false;
+    }
 
     /// <summary>
     /// Get a random sound path from the config.
@@ -86,16 +139,22 @@ public class EndRoundSoundsPlugin : BasePlugin, IPluginConfig<EndRoundSoundsConf
         {
             if (player.Team == winningTeam)
             {
-                return Config.SoundsWin[Random.Shared.NextDistinct(Config.SoundsWin.Count)];
+                var index = Random.Shared.NextDistinct(Config.SoundsWin.Count);
+                LogInformation($"Selecting win sound index={index} from poolSize={Config.SoundsWin.Count}");
+                return Config.SoundsWin[index];
             }
             else
             {
-                return Config.SoundsLose[Random.Shared.NextDistinct(Config.SoundsLose.Count)];
+                var index = Random.Shared.NextDistinct(Config.SoundsLose.Count);
+                LogInformation($"Selecting lose sound index={index} from poolSize={Config.SoundsLose.Count}");
+                return Config.SoundsLose[index];
             }
         }
         else
         {
-            return Config.Sounds[Random.Shared.NextDistinct(Config.Sounds.Count)];
+            var index = Random.Shared.NextDistinct(Config.Sounds.Count);
+            LogInformation($"Selecting shared sound index={index} from poolSize={Config.Sounds.Count}");
+            return Config.Sounds[index];
         }
     }
 
@@ -105,8 +164,12 @@ public class EndRoundSoundsPlugin : BasePlugin, IPluginConfig<EndRoundSoundsConf
     /// </summary>
     /// <param name="player"></param>
     /// <param name="path">Path to sound file in workshop items</param>
-    private static void PlaySoundForPlayer(CCSPlayerController player, string path) =>
-        player.ExecuteClientCommand($"play \"{path}\"");
+    private void PlaySoundForPlayer(CCSPlayerController player, string path)
+    {
+        var command = $"play \"{path}\"";
+        LogInformation($"Executing client command for playerTeam={player.Team}: {command}");
+        player.ExecuteClientCommand(command);
+    }
 }
 
 public class EndRoundSoundsConfig : BasePluginConfig
